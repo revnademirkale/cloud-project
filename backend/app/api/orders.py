@@ -1,5 +1,10 @@
 import os
 import smtplib
+import boto3
+from botocore.exceptions import ClientError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 from email.message import EmailMessage
 from email.utils import formataddr
 from fastapi import APIRouter, Header, HTTPException, Depends
@@ -82,34 +87,72 @@ def build_invoice_pdf(order_code: str, date_str: str, total: float, items: list,
 
 
 def send_invoice_email(recipient: str, order_code: str, pdf_bytes: bytes) -> bool:
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_password = os.getenv("SMTP_PASSWORD")
-    mail_from = os.getenv("MAIL_FROM") or smtp_user
+    mail_from = os.getenv("MAIL_FROM") or os.getenv("SMTP_USER")
 
-    if not all([smtp_host, smtp_user, smtp_password, mail_from, recipient]):
+    # --- SES ile gönder (önce dene) ---
+    try:
+        msg = MIMEMultipart()
+        msg["Subject"] = f"TicketHub Faturanız - {order_code}"
+        msg["From"] = formataddr(("TicketHub", mail_from))
+        msg["To"] = recipient
+
+        body = MIMEText(
+            f"Merhaba,\n\n{order_code} numaralı siparişinizin PDF faturası ekte yer almaktadır.\n\nTicketHub",
+            "plain"
+        )
+        msg.attach(body)
+
+        attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
+        attachment.add_header("Content-Disposition", "attachment", filename=f"fatura-{order_code}.pdf")
+        msg.attach(attachment)
+
+        ses_client = boto3.client("ses", region_name=os.getenv("AWS_REGION", "eu-west-1"))
+        ses_client.send_raw_email(
+            Source=mail_from,
+            Destinations=[recipient],
+            RawMessage={"Data": msg.as_string()},
+        )
+        print(f"Invoice email sent via SES for order {order_code}")
+        return True
+
+    except Exception as ses_exc:
+        print(f"SES failed for order {order_code}: {ses_exc} — falling back to SMTP")
+
+    # --- SMTP fallback ---
+    try:
+        smtp_host = os.getenv("SMTP_HOST")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+
+        if not all([smtp_host, smtp_user, smtp_password, mail_from, recipient]):
+            return False
+
+        smtp_msg = EmailMessage()
+        smtp_msg["Subject"] = f"TicketHub Faturanız - {order_code}"
+        smtp_msg["From"] = formataddr(("TicketHub", mail_from))
+        smtp_msg["To"] = recipient
+        smtp_msg.set_content(
+            f"Merhaba,\n\n{order_code} numaralı siparişinizin PDF faturası ekte yer almaktadır.\n\nTicketHub"
+        )
+        smtp_msg.add_attachment(
+            pdf_bytes,
+            maintype="application",
+            subtype="pdf",
+            filename=f"fatura-{order_code}.pdf",
+        )
+
+        with smtplib.SMTP(smtp_host, smtp_port) as smtp:
+            smtp.starttls()
+            smtp.login(smtp_user, smtp_password)
+            smtp.send_message(smtp_msg)
+        print(f"Invoice email sent via SMTP for order {order_code}")
+        return True
+
+    except Exception as smtp_exc:
+        print(f"SMTP also failed for order {order_code}: {smtp_exc}")
         return False
 
-    msg = EmailMessage()
-    msg["Subject"] = f"TicketHub Faturanız - {order_code}"
-    msg["From"] = formataddr(("TicketHub", mail_from))
-    msg["To"] = recipient
-    msg.set_content(
-        f"Merhaba,\n\n{order_code} numaralı siparişinizin PDF faturası ekte yer almaktadır.\n\nTicketHub"
-    )
-    msg.add_attachment(
-        pdf_bytes,
-        maintype="application",
-        subtype="pdf",
-        filename=f"fatura-{order_code}.pdf",
-    )
-
-    with smtplib.SMTP(smtp_host, smtp_port) as smtp:
-        smtp.starttls()
-        smtp.login(smtp_user, smtp_password)
-        smtp.send_message(msg)
-    return True
 
 async def get_current_user(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
@@ -138,7 +181,6 @@ def normalize_order_id(order_id: str) -> int:
 async def create_order(order: CreateOrder, user=Depends(get_current_user)):
     user_id = user.id
     
-    # Create order first
     order_data = {
         "user_id": user_id,
         "total": order.total,
@@ -152,10 +194,8 @@ async def create_order(order: CreateOrder, user=Depends(get_current_user)):
     created_order = order_res.data[0]
     order_id = created_order["id"]
     
-    # Create order items
     items_data = []
     for item in order.items:
-        # Update event capacities
         event_res = supabase.table("events").select("remaining_capacity, ticket_categories").eq("id", item.event_id).execute()
         if event_res.data:
             event_data = event_res.data[0]
@@ -190,7 +230,6 @@ async def create_order(order: CreateOrder, user=Depends(get_current_user)):
     if items_data:
         supabase.table("order_items").insert(items_data).execute()
 
-    # Create one ticket per quantity per item
     tickets_data = []
     for item in order.items:
         for _ in range(item.quantity):
@@ -202,9 +241,7 @@ async def create_order(order: CreateOrder, user=Depends(get_current_user)):
     tickets_res = supabase.table("tickets").insert(tickets_data).execute()
     tokens = [t["token"] for t in (tickets_res.data or [])]
 
-    # Format created order response
     created_at = created_order["created_at"]
-    # Parse timestamptz to simple date format DD.MM.YYYY
     try:
         dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
         date_str = dt.strftime("%d.%m.%Y")
@@ -243,7 +280,6 @@ async def create_order(order: CreateOrder, user=Depends(get_current_user)):
 async def get_orders(user=Depends(get_current_user)):
     user_id = user.id
     
-    # Fetch orders
     orders_res = supabase.table("orders").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
     orders_data = orders_res.data
     
@@ -252,11 +288,9 @@ async def get_orders(user=Depends(get_current_user)):
         
     order_ids = [o["id"] for o in orders_data]
     
-    # Fetch all items for these orders
     items_res = supabase.table("order_items").select("*").in_("order_id", order_ids).execute()
     items_data = items_res.data
     
-    # Group items by order
     items_by_order = {}
     for item in items_data:
         oid = item["order_id"]
@@ -274,7 +308,6 @@ async def get_orders(user=Depends(get_current_user)):
         
     result = []
     for o in orders_data:
-        # Format date
         created_at = o["created_at"]
         try:
             dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
